@@ -1,0 +1,230 @@
+# Taskfile for ShopStream Data Pipeline
+#
+# This file contains tasks for installing lightweight dev dependencies,
+# starting services, and building/running the Go executor.
+# Task docs: https://taskfile.dev
+
+version: '3'
+
+tasks:
+  # High-level: install all required local dev dependencies
+  install-deps:
+    desc: "Install all lightweight dependencies (Docker, Go, pglite, Redis image)."
+    cmds:
+      - echo "Installing dependencies..."
+      - task: install-docker
+      - task: install-go
+      - task: install-bun
+      - task: install-pglite
+      - task: install-redis-image
+
+  # Checks if Docker is installed and provides guidance if not.
+  install-docker:
+    desc: "Check for Docker and provide installation instructions."
+    cmds:
+      - |
+        if ! command -v docker &> /dev/null; then
+          echo "Docker is not installed. Please install it from https://www.docker.com/products/docker-desktop" >&2
+          exit 1
+        fi
+        echo "Docker is installed: $(docker --version)"
+
+  # Checks if Go is installed and provides guidance if not.
+  install-go:
+    desc: "Check for Go and provide installation instructions."
+    cmds:
+      - |
+        if ! command -v go &> /dev/null; then
+          echo "Go is not installed. Please install it from https://golang.org/doc/install" >&2
+          exit 1
+        fi
+        echo "Go is installed: $(go version)"
+
+  # Installs Bun, a fast JavaScript runtime.
+  install-bun:
+    desc: "Install Bun JavaScript runtime."
+    cmds:
+      - |
+        if ! command -v bun &> /dev/null; then
+          echo "Installing Bun..."
+          curl -fsSL https://bun.sh/install | bash
+        else
+          echo "Bun is already installed."
+        fi
+    status:
+      - command -v bun &> /dev/null
+
+  # Installs pglite using Bun.
+  install-pglite:
+    desc: "Install pglite JS packages globally via Bun."
+    deps: [install-bun]
+    cmds:
+      - ~/.bun/bin/bun add -g @electric-sql/pglite @electric-sql/pglite-socket
+
+  # Pulls Redis Stack Server Docker image to provide Redis + Streams locally.
+  install-redis-image:
+    desc: "Pull Redis Stack Server Docker image."
+    cmds:
+      - |
+        if ! command -v docker &> /dev/null; then
+          echo "Docker is not installed or not on PATH. Please install Docker Desktop first." >&2
+          exit 1
+        fi
+        docker pull redis/redis-stack-server:latest
+
+  # Starts Redis (Docker), pglite, and the Go executor (foreground)
+  start-services:
+    desc: "Start Redis (Docker), pglite, and the Go executor."
+    cmds:
+      - task: wait-for-redis
+      - task: wait-for-pglite
+      - task: start-executor
+
+  # Start Redis via Docker container
+  start-redis:
+    desc: "Start Redis server using Docker."
+    cmds:
+      - docker start redis >/dev/null 2>&1 || docker run -d --name redis -p 6379:6379 --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=5s --health-retries=5 redis/redis-stack-server:latest
+      - echo "Redis is running."
+
+
+
+  # Waits for the Redis server to be ready.
+  wait-for-redis:
+    desc: "Wait for Redis server to become healthy."
+    deps: [start-redis]
+    cmds:
+      - |
+        echo "Waiting for Redis container to become healthy..."
+        for i in {1..30}; do # ~30 seconds timeout
+          STATUS=$(docker inspect --format '{{ "{{.State.Health.Status}}" }}' redis 2>/dev/null)
+          if [ "$STATUS" = "healthy" ]; then
+            echo "Redis is healthy."
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "Error: Timed out waiting for Redis to become healthy."
+        exit 1
+
+  # Waits for the pglite server to be ready.
+  wait-for-pglite:
+    desc: "Wait for pglite server to become available."
+    deps: [start-pglite]
+    cmds:
+      - |
+        echo "Waiting for pglite on port 5432..."
+        for i in {1..600}; do # ~60 seconds timeout
+          if (</dev/tcp/127.0.0.1/5432) &>/dev/null; then
+            echo "pglite is ready."
+            exit 0
+          fi
+          sleep 0.1
+        done
+        echo "Error: Timed out waiting for pglite."
+        exit 1
+
+  # Start pglite in the background (stores data under code/pgdata)
+  start-pglite:
+    desc: "Start pglite server using the script."
+    cmds:
+      - ./scripts/start-pglite.sh
+
+  # Start the Go executor (foreground)
+  start-executor:
+    desc: "Start the Go executor application (foreground)."
+    dir: executor
+    cmds:
+      - go run .
+    env:
+      REDIS_ADDR: "localhost:6379"
+      PG_CONN_STR: "postgresql://user:password@localhost:5432/postgres?sslmode=disable"
+
+  # Start the Go executor (background), logs to executor/logs/executor.log
+  start-executor-bg:
+    desc: "Start the Go executor in background (logs in executor/logs/executor.log)."
+    dir: executor
+    cmds:
+      - mkdir -p logs
+      - nohup bash -lc "REDIS_ADDR=localhost:6379 PG_CONN_STR='postgresql://user:password@localhost:5432/postgres?sslmode=disable' go run ." > logs/executor.log 2>&1 &
+
+  # Stop running services (Redis container). To stop pglite/executor-bg, kill by process or add specific tasks.
+  stop-pglite:
+    desc: "Stop the pglite server process using its PID file."
+    cmds:
+      - |
+        if [ -f /tmp/pglite.pid ]; then
+          kill "$(cat /tmp/pglite.pid)"
+          rm /tmp/pglite.pid
+        fi
+
+  # Stop running services (Redis container and pglite server).
+  stop-services:
+    desc: "Stop and remove the Redis container and pglite server."
+    cmds:
+      - task: stop-pglite
+      - docker stop redis >/dev/null 2>&1 || true
+      - docker rm redis >/dev/null 2>&1 || true
+      - echo "Services stopped."
+
+  # Redis CLI shortcuts
+  redis-cli:
+    desc: "Connect to Redis CLI."
+    cmds:
+      - docker exec -it redis redis-cli
+
+  redis-stream-cli:
+    desc: "Tail main stream via Redis CLI."
+    cmds:
+      - bash -lc 'docker exec -it redis redis-cli XREAD BLOCK 0 STREAMS events-stream $'
+
+  redis-dlq-cli:
+    desc: "Tail DLQ stream via Redis CLI."
+    cmds:
+      - bash -lc 'docker exec -it redis redis-cli XREAD BLOCK 0 STREAMS dlq $'
+
+
+  # psql CLI to pglite (requires psql installed locally)
+  pg-cli:
+    desc: "Connect to pglite using psql."
+    cmds:
+      - psql "postgresql://user:password@localhost:5432/postgres?sslmode=disable"
+
+  # Load test data from Data/ via helper Go script
+  load-test-data:
+    desc: "Load test data into Redis."
+    dir: ./scripts
+    deps: [wait-for-redis]
+    cmds:
+      - go run ./load_test_data.go
+
+  # Compile the Go executor
+  build-executor:
+    desc: "Compile the Go executor (output: executor/bin/executor)."
+    dir: executor
+    cmds:
+      - |
+        if [ ! -f go.mod ]; then
+          go mod init main
+          go get github.com/redis/go-redis/v9
+        fi
+      - mkdir -p bin
+      - go build -o bin/executor main.go
+
+  # Run the Go executor
+  # --- Simplified Foreground Tasks for Manual Execution ---
+  run-pglite-fg:
+    desc: "(Terminal 1) Run pglite server in the foreground."
+    cmds:
+      - "$HOME/.bun/bin/pglite-server -d ./pgdata"
+
+  run-executor-fg:
+    desc: "(Terminal 2) Run the executor (assumes services are running)."
+    dir: ./executor
+    deps: [build-executor]
+    cmds:
+      - ./bin/executor
+
+  # Run a full end-to-end test
+
+
